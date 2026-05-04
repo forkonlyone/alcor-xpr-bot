@@ -38,7 +38,7 @@ async function main() {
 
   const alcorApi = new AlcorApi(config.alcorApiUrl, logger);
   const finder = new RouteFinder(alcorApi, config, logger);
-  const executor = new SwapExecutor(config, logger);
+  const executor = new SwapExecutor(config, logger, alcorApi);
   executor.initialize();
 
   const balance = await executor.getXprBalance();
@@ -83,18 +83,11 @@ async function main() {
 
           logger.info(`[Scan #${totalScans}] Trying route #${i + 1}/${routes.length}: ${route.profitPercent.toFixed(4)}% | ${route.description}`);
 
-          // Primary: multi-hop with retry
-          let result = await executor.executeRoute(route);
-
-          // Fallback: step-by-step execution if multi-hop fails on liquidity
-          if (!result.success && result.error && result.error.includes('not enough') && !config.dryRun) {
-            logger.warn('Multi-hop failed, trying step-by-step execution...');
-            result = await executor.executeStepByStep(route);
-          }
+          const result = await executor.executeRoute(route);
 
           if (result.success) {
             totalTradesExecuted++;
-            totalProfitXpr += route.profitXpr * (result.factor || 1);
+            totalProfitXpr += route.profitXpr;
             traded = true;
             logger.info(`Trade ${result.dryRun ? '(simulated)' : ''} successful! Cumulative profit: ${totalProfitXpr.toFixed(4)} XPR`);
 

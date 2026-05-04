@@ -1,22 +1,16 @@
 import { Api, JsonRpc, JsSignatureProvider } from '@proton/js';
 import fetch from 'node-fetch';
 import { ALCOR_SWAP_CONTRACT, XPR_TOKEN } from '../config/constants.js';
-import { formatAsset } from '../utils/math.js';
+import { formatAsset, maxInputFromTicks, estimatePoolCapacity } from '../utils/math.js';
 
-// Retry scale factors — each attempt uses a smaller input
-const RETRY_FACTORS = [1.0, 0.75, 0.50, 0.30, 0.15];
+// When pool capacity is unknown we retry with these fractions
+const RETRY_FACTORS = [1.0, 0.60, 0.30, 0.10, 0.05];
 
-/**
- * Executes swap transactions on the Proton chain via Alcor's swap contract.
- *
- * Swap mechanism:
- *   Transfer input token to swap.alcor with memo:
- *   "swapexactin#<PoolIDs>#<Recipient>#<MinOutput Token@Contract>#<Deadline>"
- */
 export class SwapExecutor {
-  constructor(config, logger) {
+  constructor(config, logger, alcorApi) {
     this.config = config;
     this.logger = logger;
+    this.alcorApi = alcorApi;
     this.rpc = null;
     this.api = null;
     this.currentEndpointIndex = 0;
@@ -43,164 +37,134 @@ export class SwapExecutor {
   }
 
   /**
-   * Execute a complete arbitrage route with aggressive retry.
-   *
-   * On "not enough to swap" errors the bot retries with progressively
-   * smaller input amounts (75%, 50%, 30%, 15%) until one goes through.
-   * Minimum output is set to the smallest possible unit (e.g. 0.0001)
-   * so the on-chain swap never reverts due to slippage.  Profit was
-   * already validated off-chain before calling this method.
+   * Execute route — always step-by-step for maximum reliability.
+   * Before each step:
+   *   1. Refresh pool state from chain
+   *   2. Fetch tick data to determine max capacity
+   *   3. Auto-cap input to what the pool can actually handle
+   *   4. Set minimum output to 1 smallest unit (forced success)
+   *   5. If step still fails, retry with smaller fractions
    */
   async executeRoute(route) {
     if (this.config.dryRun) {
-      this.logRouteInfo(route, route.steps[0].amountIn);
-      this.logger.info('DRY RUN - Trade NOT executed');
+      this.logger.info(`DRY RUN: ${route.description} | +${route.profitXpr.toFixed(4)} XPR (${route.profitPercent.toFixed(2)}%)`);
       return { success: true, dryRun: true, route };
     }
 
-    // Try progressively smaller amounts
-    for (let attempt = 0; attempt < RETRY_FACTORS.length; attempt++) {
-      const factor = RETRY_FACTORS[attempt];
-      const result = await this.tryExecute(route, factor, attempt);
-      if (result.success) return result;
+    const { steps } = route;
+    const username = this.config.username;
 
-      // Only retry on "not enough" errors
-      const retryable =
-        result.error &&
-        (result.error.includes('not enough') ||
-         result.error.includes('insufficient') ||
-         result.error.includes('overflows'));
-      if (!retryable) return result;
+    for (let i = 0; i < steps.length; i++) {
+      const step = steps[i];
+      this.logger.info(`Step ${i + 1}/${steps.length}: ${step.tokenIn.symbol} → ${step.tokenOut.symbol} (pool ${step.poolId})`);
 
-      this.logger.warn(`Attempt ${attempt + 1} failed, retrying at ${Math.round(RETRY_FACTORS[attempt + 1] * 100)}% amount...`);
+      // 1. Refresh pool from chain
+      const pool = await this.alcorApi.refreshPoolFromChain(step.poolId, this.rpc);
+
+      // 2. Fetch tick data to find real capacity
+      const ticks = await this.alcorApi.fetchPoolTicks(step.poolId, this.rpc);
+
+      // 3. Determine the input amount
+      let desiredInput;
+      if (i === 0) {
+        desiredInput = step.amountIn;
+      } else {
+        // For subsequent steps, use actual token balance
+        const bal = await this.getTokenBalance(step.tokenIn.contract, username, step.tokenIn.symbol);
+        if (bal <= 0) {
+          this.logger.error(`Zero ${step.tokenIn.symbol} balance at step ${i + 1}`);
+          return { success: false, error: `Zero ${step.tokenIn.symbol} balance`, route, failedStep: i };
+        }
+        desiredInput = bal;
+      }
+
+      // 4. Cap to pool capacity
+      const inputIsTokenA = this.isTokenA(pool, step.tokenIn);
+      let maxInput = Infinity;
+
+      if (ticks.length > 0 && pool) {
+        const tickMax = maxInputFromTicks(pool, ticks, inputIsTokenA);
+        if (tickMax > 0) maxInput = tickMax;
+      }
+      if (maxInput === Infinity && pool) {
+        // Fallback heuristic capacity
+        const cap = estimatePoolCapacity(pool);
+        const heurMax = inputIsTokenA ? cap.maxInputA : cap.maxInputB;
+        if (heurMax > 0) maxInput = heurMax;
+      }
+
+      const cappedInput = maxInput < Infinity ? Math.min(desiredInput, maxInput) : desiredInput;
+      if (cappedInput < desiredInput) {
+        this.logger.warn(`Capping input from ${desiredInput.toFixed(4)} to ${cappedInput.toFixed(4)} ${step.tokenIn.symbol} (pool capacity)`);
+      }
+
+      // 5. Execute with retry
+      const ok = await this.executeStep(step, cappedInput, username);
+      if (!ok) {
+        // Retry with smaller fractions
+        let succeeded = false;
+        for (let r = 1; r < RETRY_FACTORS.length; r++) {
+          const retryAmount = cappedInput * RETRY_FACTORS[r];
+          this.logger.warn(`Retrying step ${i + 1} at ${Math.round(RETRY_FACTORS[r] * 100)}% (${retryAmount.toFixed(4)} ${step.tokenIn.symbol})`);
+          const retryOk = await this.executeStep(step, retryAmount, username);
+          if (retryOk) { succeeded = true; break; }
+        }
+        if (!succeeded) {
+          return { success: false, error: `Step ${i + 1} failed after all retries`, route, failedStep: i };
+        }
+      }
     }
 
-    return { success: false, error: 'All retry attempts exhausted', route };
+    this.logger.info(`All ${steps.length} steps completed successfully!`);
+    return { success: true, dryRun: false, route, mode: 'step-by-step' };
   }
 
   /**
-   * Single execution attempt at a given fraction of the original amount.
+   * Execute a single swap step.
    */
-  async tryExecute(route, factor, attempt) {
-    const { steps } = route;
-    const username = this.config.username;
-    const firstStep = steps[0];
-    const lastStep = steps[steps.length - 1];
+  async executeStep(step, inputAmount, username) {
+    // Minimum output = 1 smallest unit → force the swap through
+    const tinyMinOutput = formatAsset(1 / (10 ** step.tokenOut.decimals), step.tokenOut.decimals);
+    const memo = `swapexactin#${step.poolId}#${username}#${tinyMinOutput} ${step.tokenOut.symbol}@${step.tokenOut.contract}#0`;
+    const quantity = `${formatAsset(inputAmount, step.tokenIn.decimals)} ${step.tokenIn.symbol}`;
 
-    // Scale the input amount
-    const scaledAmountIn = firstStep.amountIn * factor;
-
-    // ---- Build multi-hop memo (all pools in one transfer) ----
-    const poolIds = steps.map(s => s.poolId).join(',');
-
-    // Force minimum output as low as possible (1 smallest unit)
-    // This prevents "not enough" revert from the output side.
-    // Profit was already verified off-chain.
-    const tinyMinOutput = formatAsset(1 / (10 ** lastStep.tokenOut.decimals), lastStep.tokenOut.decimals);
-
-    const deadline = 0;
-    const memo = `swapexactin#${poolIds}#${username}#${tinyMinOutput} ${lastStep.tokenOut.symbol}@${lastStep.tokenOut.contract}#${deadline}`;
-
-    const inputAmount = formatAsset(scaledAmountIn, firstStep.tokenIn.decimals);
-    const quantity = `${inputAmount} ${firstStep.tokenIn.symbol}`;
-
-    this.logRouteInfo(route, scaledAmountIn, attempt);
-    this.logger.info(`Memo: ${memo}`);
+    this.logger.info(`  Swap: ${quantity} → min ${tinyMinOutput} ${step.tokenOut.symbol}`);
+    this.logger.debug(`  Memo: ${memo}`);
 
     try {
       const result = await this.api.transact(
         {
           actions: [
             {
-              account: firstStep.tokenIn.contract,
+              account: step.tokenIn.contract,
               name: 'transfer',
               authorization: [{ actor: username, permission: 'active' }],
-              data: {
-                from: username,
-                to: ALCOR_SWAP_CONTRACT,
-                quantity,
-                memo,
-              },
+              data: { from: username, to: ALCOR_SWAP_CONTRACT, quantity, memo },
             },
           ],
         },
         { blocksBehind: 3, expireSeconds: 30 },
       );
-
       const txId = result.transaction_id || result.processed?.id || 'unknown';
-      this.logger.info(`Trade executed! TX: ${txId}`);
-      return { success: true, dryRun: false, txId, route, factor };
+      this.logger.info(`  TX: ${txId}`);
+      return true;
     } catch (error) {
       const errMsg = error.json?.error?.details?.[0]?.message || error.message || String(error);
-      this.logger.error(`Trade failed (attempt ${attempt + 1}, factor ${factor}): ${errMsg}`);
+      this.logger.error(`  Failed: ${errMsg}`);
 
       if (errMsg.includes('fetch') || errMsg.includes('ECONNREFUSED') || errMsg.includes('timeout')) {
         this.failover();
       }
-      return { success: false, error: errMsg, route };
+      return false;
     }
   }
 
   /**
-   * If multi-hop fails completely, try executing each step individually.
-   * Step 1 sends XPR → swap.alcor (get token).
-   * Step 2 sends token → swap.alcor (get XPR back).
+   * Determine if a token is tokenA or tokenB of the pool.
    */
-  async executeStepByStep(route) {
-    const { steps } = route;
-    const username = this.config.username;
-
-    for (let i = 0; i < steps.length; i++) {
-      const step = steps[i];
-      const tinyMinOutput = formatAsset(1 / (10 ** step.tokenOut.decimals), step.tokenOut.decimals);
-      const deadline = 0;
-      const memo = `swapexactin#${step.poolId}#${username}#${tinyMinOutput} ${step.tokenOut.symbol}@${step.tokenOut.contract}#${deadline}`;
-
-      // For step 0 use the original input; for later steps query the actual balance
-      let inputAmount;
-      if (i === 0) {
-        inputAmount = formatAsset(step.amountIn, step.tokenIn.decimals);
-      } else {
-        const bal = await this.getTokenBalance(step.tokenIn.contract, username, step.tokenIn.symbol);
-        if (bal <= 0) {
-          this.logger.error(`Step ${i + 1}: zero balance of ${step.tokenIn.symbol}, aborting`);
-          return { success: false, error: `Zero ${step.tokenIn.symbol} balance at step ${i + 1}`, route };
-        }
-        inputAmount = formatAsset(bal, step.tokenIn.decimals);
-      }
-
-      const quantity = `${inputAmount} ${step.tokenIn.symbol}`;
-      this.logger.info(`Step ${i + 1}/${steps.length}: ${quantity} → ${step.tokenOut.symbol} (pool ${step.poolId})`);
-
-      try {
-        await this.api.transact(
-          {
-            actions: [
-              {
-                account: step.tokenIn.contract,
-                name: 'transfer',
-                authorization: [{ actor: username, permission: 'active' }],
-                data: { from: username, to: ALCOR_SWAP_CONTRACT, quantity, memo },
-              },
-            ],
-          },
-          { blocksBehind: 3, expireSeconds: 30 },
-        );
-        this.logger.info(`Step ${i + 1} succeeded`);
-      } catch (error) {
-        const errMsg = error.json?.error?.details?.[0]?.message || error.message || String(error);
-        this.logger.error(`Step ${i + 1} failed: ${errMsg}`);
-        return { success: false, error: errMsg, route, failedStep: i };
-      }
-    }
-
-    return { success: true, dryRun: false, route, mode: 'step-by-step' };
-  }
-
-  logRouteInfo(route, amountIn, attempt) {
-    const tag = attempt !== undefined ? ` (attempt ${attempt + 1})` : '';
-    this.logger.info(`Executing${tag}: ${amountIn.toFixed(4)} XPR | ${route.description}`);
-    this.logger.info(`Expected profit: ${route.profitPercent.toFixed(4)}% (+${route.profitXpr.toFixed(4)} XPR)`);
+  isTokenA(pool, token) {
+    if (!pool) return true;
+    return pool.tokenA?.symbol === token.symbol && pool.tokenA?.contract === token.contract;
   }
 
   async getXprBalance() {
