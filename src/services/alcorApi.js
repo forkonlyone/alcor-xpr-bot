@@ -1,7 +1,7 @@
 import fetch from 'node-fetch';
 
 /**
- * Fetches and manages pool data from the Alcor API.
+ * Fetches and manages pool data from the Alcor API and on-chain.
  */
 export class AlcorApi {
   constructor(baseUrl, logger) {
@@ -9,12 +9,9 @@ export class AlcorApi {
     this.logger = logger;
     this.pools = [];
     this.poolMap = new Map();
-    this.tokenPools = new Map(); // tokenId → [pool]
+    this.tokenPools = new Map();
   }
 
-  /**
-   * Fetch all swap pools from Alcor API.
-   */
   async fetchPools() {
     const url = `${this.baseUrl}/swap/pools`;
     this.logger.debug(`Fetching pools from ${url}`);
@@ -27,7 +24,6 @@ export class AlcorApi {
     const data = await response.json();
     this.pools = data;
 
-    // Build lookup maps
     this.poolMap.clear();
     this.tokenPools.clear();
 
@@ -48,31 +44,19 @@ export class AlcorApi {
     return this.pools;
   }
 
-  /**
-   * Get pools that contain a specific token.
-   */
   getPoolsForToken(symbol, contract) {
     const tokenId = `${symbol}-${contract}`;
     return this.tokenPools.get(tokenId) || [];
   }
 
-  /**
-   * Get pool by ID.
-   */
   getPool(poolId) {
     return this.poolMap.get(poolId);
   }
 
-  /**
-   * Filter pools by minimum TVL.
-   */
   getPoolsWithMinTvl(minTvl) {
     return this.pools.filter(p => p.tvlUSD >= minTvl);
   }
 
-  /**
-   * Get XPR pools with sufficient liquidity.
-   */
   getXprPools(minTvl = 0) {
     return this.pools.filter(p => {
       const hasXpr =
@@ -83,8 +67,55 @@ export class AlcorApi {
   }
 
   /**
-   * For a given pool, determine which side is XPR and which is the other token.
+   * Refresh pool state directly from the blockchain (freshest data).
    */
+  async refreshPoolFromChain(poolId, rpc) {
+    try {
+      const result = await rpc.get_table_rows({
+        code: 'swap.alcor',
+        scope: 'swap.alcor',
+        table: 'pools',
+        lower_bound: poolId,
+        upper_bound: poolId,
+        limit: 1,
+        json: true,
+      });
+      if (result.rows.length > 0) {
+        const row = result.rows[0];
+        const pool = this.poolMap.get(poolId);
+        if (pool) {
+          pool.liquidity = String(row.currSlot?.liquidity || row.liquidity || pool.liquidity);
+          pool.sqrtPriceX64 = String(row.currSlot?.sqrtPriceX64 || row.sqrtPriceX64 || pool.sqrtPriceX64);
+          pool.tick = row.currSlot?.tick ?? row.tick ?? pool.tick;
+        }
+        return pool;
+      }
+    } catch (err) {
+      this.logger.debug(`Failed to refresh pool ${poolId} from chain: ${err.message}`);
+    }
+    return this.poolMap.get(poolId);
+  }
+
+  /**
+   * Fetch initialized tick data for a pool from the blockchain.
+   * Returns array of {id, liquidityNet, liquidityGross, ...}.
+   */
+  async fetchPoolTicks(poolId, rpc) {
+    try {
+      const result = await rpc.get_table_rows({
+        code: 'swap.alcor',
+        scope: String(poolId),
+        table: 'ticks',
+        limit: 100,
+        json: true,
+      });
+      return result.rows || [];
+    } catch (err) {
+      this.logger.debug(`Failed to fetch ticks for pool ${poolId}: ${err.message}`);
+      return [];
+    }
+  }
+
   static getXprSide(pool) {
     if (pool.tokenA.symbol === 'XPR' && pool.tokenA.contract === 'eosio.token') {
       return { xprSide: 'A', otherToken: pool.tokenB };
