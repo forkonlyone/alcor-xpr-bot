@@ -1,0 +1,26 @@
+{
+  "name": "alcor-xpr-bot",
+  "version": "1.0.0",
+  "description": "Automated arbitrage trading bot for Alcor Exchange on Proton (XPR) chain",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dry-run": "DRY_RUN=true node src/index.js",
+    "scan": "node src/scanner.js",
+    "lint": "eslint src/",
+    "test": "echo 'No tests configured yet'"
+  },
+  "keywords": ["alcor", "proton", "xpr", "arbitrage", "trading", "bot", "dex"],
+  "author": "forkonlyone",
+  "license": "MIT",
+  "dependencies": {
+    "@proton/js": "^30.1.0",
+    "node-fetch": "^3.3.2",
+    "dotenv": "^16.4.5",
+    "winston": "^3.13.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0"
+  }
+}
