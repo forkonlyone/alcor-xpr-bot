@@ -36,13 +36,11 @@ async function main() {
   logger.info(`Mode: ${config.dryRun ? 'DRY RUN (simulation)' : 'LIVE TRADING'}`);
   logger.info('');
 
-  // Initialize services
   const alcorApi = new AlcorApi(config.alcorApiUrl, logger);
   const finder = new RouteFinder(alcorApi, config, logger);
   const executor = new SwapExecutor(config, logger);
   executor.initialize();
 
-  // Check initial balance
   const balance = await executor.getXprBalance();
   logger.info(`XPR Balance: ${balance.toFixed(4)} XPR`);
   if (balance < config.tradeAmountXpr && !config.dryRun) {
@@ -50,7 +48,6 @@ async function main() {
     process.exit(1);
   }
 
-  // Statistics
   let totalScans = 0;
   let totalOpportunities = 0;
   let totalTradesExecuted = 0;
@@ -59,7 +56,6 @@ async function main() {
 
   logger.info('Starting scan loop... Press Ctrl+C to stop.\n');
 
-  // Graceful shutdown
   process.on('SIGINT', () => {
     logger.info('\nShutting down...');
     logger.info(`Total scans: ${totalScans}`);
@@ -71,40 +67,45 @@ async function main() {
 
   while (running) {
     try {
-      // Refresh pool data each cycle
       await alcorApi.fetchPools();
       totalScans++;
 
-      // Find profitable routes
       const routes = finder.findProfitableRoutes(config.tradeAmountXpr);
 
       if (routes.length > 0) {
         totalOpportunities += routes.length;
-        const best = routes[0];
 
-        logger.info(`[Scan #${totalScans}] Found ${routes.length} route(s). Best: ${best.profitPercent.toFixed(4)}% (+${best.profitXpr.toFixed(4)} XPR)`);
-        logger.info(`  Route: ${best.description}`);
+        // Try routes in order until one succeeds
+        let traded = false;
+        for (let i = 0; i < Math.min(routes.length, 5) && !traded; i++) {
+          const route = routes[i];
+          if (route.profitXpr <= 0) continue;
 
-        // Double-check: verify the best route is still within acceptable bounds
-        if (best.profitXpr <= 0) {
-          logger.warn('Best route has non-positive profit after recalculation. Skipping.');
-        } else {
-          // Execute the best route
-          const result = await executor.executeRoute(best);
+          logger.info(`[Scan #${totalScans}] Trying route #${i + 1}/${routes.length}: ${route.profitPercent.toFixed(4)}% | ${route.description}`);
+
+          // Primary: multi-hop with retry
+          let result = await executor.executeRoute(route);
+
+          // Fallback: step-by-step execution if multi-hop fails on liquidity
+          if (!result.success && result.error && result.error.includes('not enough') && !config.dryRun) {
+            logger.warn('Multi-hop failed, trying step-by-step execution...');
+            result = await executor.executeStepByStep(route);
+          }
 
           if (result.success) {
             totalTradesExecuted++;
-            totalProfitXpr += best.profitXpr;
+            totalProfitXpr += route.profitXpr * (result.factor || 1);
+            traded = true;
             logger.info(`Trade ${result.dryRun ? '(simulated)' : ''} successful! Cumulative profit: ${totalProfitXpr.toFixed(4)} XPR`);
 
-            // Brief cooldown after successful trade to let pools rebalance
             await sleep(2000);
 
-            // Re-check balance after trade
             if (!config.dryRun) {
               const newBalance = await executor.getXprBalance();
               logger.info(`Updated balance: ${newBalance.toFixed(4)} XPR`);
             }
+          } else {
+            logger.warn(`Route #${i + 1} failed: ${result.error}. Trying next route...`);
           }
         }
 

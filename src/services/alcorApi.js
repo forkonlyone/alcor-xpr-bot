@@ -83,6 +83,37 @@ export class AlcorApi {
   }
 
   /**
+   * Refresh a single pool's on-chain data from an RPC endpoint.
+   * Used to get the freshest sqrtPrice/liquidity right before a trade.
+   */
+  async refreshPoolFromChain(poolId, rpc) {
+    try {
+      const result = await rpc.get_table_rows({
+        code: 'swap.alcor',
+        scope: 'swap.alcor',
+        table: 'pools',
+        lower_bound: poolId,
+        upper_bound: poolId,
+        limit: 1,
+        json: true,
+      });
+      if (result.rows.length > 0) {
+        const row = result.rows[0];
+        const pool = this.poolMap.get(poolId);
+        if (pool) {
+          pool.liquidity = row.currSlot?.liquidity || row.liquidity || pool.liquidity;
+          pool.sqrtPriceX64 = row.currSlot?.sqrtPriceX64 || row.sqrtPriceX64 || pool.sqrtPriceX64;
+          pool.tick = row.currSlot?.tick ?? row.tick ?? pool.tick;
+        }
+        return pool;
+      }
+    } catch (err) {
+      this.logger.debug(`Failed to refresh pool ${poolId} from chain: ${err.message}`);
+    }
+    return this.poolMap.get(poolId);
+  }
+
+  /**
    * For a given pool, determine which side is XPR and which is the other token.
    */
   static getXprSide(pool) {

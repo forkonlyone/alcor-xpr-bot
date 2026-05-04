@@ -13,6 +13,7 @@ export function calcPriceAinB(sqrtPriceX64, decimalsA, decimalsB) {
 }
 
 /**
+ * Calculate token price from sqrtPriceX64.
  * tokenB price in terms of tokenA:
  *   2^128 / sqrtPriceX64^2 * 10^(precisionB - precisionA)
  */
@@ -24,53 +25,89 @@ export function calcPriceBinA(sqrtPriceX64, decimalsA, decimalsB) {
 }
 
 /**
+ * Estimate the maximum input amount a pool can handle within its current tick range.
+ * Returns the max raw input for each side (tokenA, tokenB).
+ *
+ * For tokenA input: the pool can absorb up to ~(L / sqrtPrice) tokens before
+ * price hits 0 (realistically limited by tick boundaries).
+ * For tokenB input: the pool can absorb up to ~(L * sqrtPrice / 2^64) tokens.
+ *
+ * We use a conservative 80% of theoretical max to stay within range.
+ */
+export function estimatePoolCapacity(pool) {
+  const liquidity = BigInt(pool.liquidity);
+  if (liquidity === 0n) return { maxInputA: 0, maxInputB: 0 };
+
+  const sqrtPriceX64 = BigInt(pool.sqrtPriceX64);
+  if (sqrtPriceX64 === 0n) return { maxInputA: 0, maxInputB: 0 };
+
+  // Max tokenA input ≈ L * 2^64 / sqrtPrice (conservative: 50%)
+  const maxInputARaw = (liquidity * Q64) / sqrtPriceX64 / 2n;
+  const maxInputA = Number(maxInputARaw) / (10 ** pool.tokenA.decimals);
+
+  // Max tokenB input ≈ L * sqrtPrice / 2^64 (conservative: 50%)
+  const maxInputBRaw = (liquidity * sqrtPriceX64) / Q64 / 2n;
+  const maxInputB = Number(maxInputBRaw) / (10 ** pool.tokenB.decimals);
+
+  return { maxInputA, maxInputB };
+}
+
+/**
+ * Check if a given input amount is within the pool's capacity.
+ */
+export function isWithinPoolCapacity(amountIn, pool, inputIsTokenA) {
+  const { maxInputA, maxInputB } = estimatePoolCapacity(pool);
+  if (inputIsTokenA) {
+    return amountIn <= maxInputA && maxInputA > 0;
+  }
+  return amountIn <= maxInputB && maxInputB > 0;
+}
+
+/**
  * Estimate output amount for a concentrated liquidity swap (simplified).
  * Uses the constant-product formula within the current tick range.
  *
- * For a swap of tokenA → tokenB:
- *   amountOut ≈ liquidity * (1/sqrtPrice_before - 1/sqrtPrice_after)
- *   where sqrtPrice_after = sqrtPrice * liquidity / (liquidity + amountIn * sqrtPrice)
- *
- * This is an approximation that works well for small trades relative to pool liquidity.
+ * Returns 0 if the input amount exceeds pool capacity.
  */
 export function estimateSwapOutput(amountIn, pool, inputIsTokenA) {
   const liquidity = BigInt(pool.liquidity);
   if (liquidity === 0n) return 0;
 
   const sqrtPriceX64 = BigInt(pool.sqrtPriceX64);
+  if (sqrtPriceX64 === 0n) return 0;
+
   const feeRate = pool.fee / 1_000_000;
   const amountInAfterFee = amountIn * (1 - feeRate);
 
+  // Check capacity first
+  if (!isWithinPoolCapacity(amountInAfterFee, pool, inputIsTokenA)) {
+    return 0;
+  }
+
   if (inputIsTokenA) {
-    // Swap tokenA → tokenB
     const decimalsA = pool.tokenA.decimals;
     const amountInRaw = BigInt(Math.floor(amountInAfterFee * (10 ** decimalsA)));
+    if (amountInRaw <= 0n) return 0;
 
-    // New sqrtPrice after swap
-    // sqrtPriceNew = sqrtPrice * L / (L + amountIn * sqrtPrice / 2^64)
     const numerator = sqrtPriceX64 * liquidity;
     const denominator = liquidity + (amountInRaw * sqrtPriceX64) / Q64;
     if (denominator === 0n) return 0;
     const sqrtPriceNewX64 = numerator / denominator;
 
-    // amountOut = L * (sqrtPrice - sqrtPriceNew) / (sqrtPrice * sqrtPriceNew / 2^64)
+    if (sqrtPriceNewX64 >= sqrtPriceX64) return 0;
     const deltaSqrtPrice = sqrtPriceX64 - sqrtPriceNewX64;
     const amountOutRaw = (liquidity * deltaSqrtPrice) / Q64;
 
     const decimalsB = pool.tokenB.decimals;
     return Number(amountOutRaw) / (10 ** decimalsB);
   } else {
-    // Swap tokenB → tokenA
     const decimalsB = pool.tokenB.decimals;
     const amountInRaw = BigInt(Math.floor(amountInAfterFee * (10 ** decimalsB)));
+    if (amountInRaw <= 0n) return 0;
 
-    // sqrtPriceNew = sqrtPrice + amountIn * 2^64 / L
     const sqrtPriceNewX64 = sqrtPriceX64 + (amountInRaw * Q64) / liquidity;
 
-    // amountOut = L * (1/sqrtPriceNew - 1/sqrtPrice) in tokenA terms
-    // = L * (sqrtPrice - sqrtPriceNew) ... wait, price goes up, so:
-    // amountOut = L * (sqrtPriceNew - sqrtPrice) / (sqrtPrice * sqrtPriceNew / 2^64)
-    // Simplified: amountOut = L * 2^64 * (sqrtPriceNew - sqrtPrice) / (sqrtPrice * sqrtPriceNew)
+    if (sqrtPriceNewX64 <= sqrtPriceX64) return 0;
     const deltaSqrtPrice = sqrtPriceNewX64 - sqrtPriceX64;
     if (sqrtPriceX64 === 0n || sqrtPriceNewX64 === 0n) return 0;
     const amountOutRaw = (liquidity * Q64 * deltaSqrtPrice) / (sqrtPriceX64 * sqrtPriceNewX64);
